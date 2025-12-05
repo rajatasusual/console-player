@@ -2,6 +2,8 @@
   "dependencies": [
     "curl",
     "nlohmann-json",
-    "sqlite3"
+    "portaudio",
+    "sqlite3",
+    "libsndfile"
   ]
 }
