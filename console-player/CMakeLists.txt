@@ -30,6 +30,9 @@ endif()
 # SQLite3
 find_package(SQLite3 REQUIRED)
 
+#FTXUI
+find_package(ftxui REQUIRED)
+
 
 # ============================================================================
 # Audio Player Library
@@ -73,6 +76,10 @@ target_link_libraries(console-player
         audio-player
         CURL::libcurl
         SQLite::SQLite3
+        ftxui::screen
+        ftxui::screen
+        ftxui::dom
+        ftxui::component
 )
 
 if(nlohmann_json_FOUND)

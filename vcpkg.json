@@ -1,9 +1,10 @@
 {
   "dependencies": [
     "curl",
+    "libsndfile",
     "nlohmann-json",
     "portaudio",
     "sqlite3",
-    "libsndfile"
+    "ftxui"
   ]
 }

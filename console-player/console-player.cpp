@@ -1,217 +1,423 @@
-﻿// console-player.cpp : Defines the entry point for the application.
-//
+﻿#include <ftxui/component/component.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/dom/elements.hpp>
+#include <ftxui/util/ref.hpp>
 
-#include "console-player.hpp"
-#include "audio-player.hpp" 
-
-#include <iostream>
-#include <string>
-#include <curl/curl.h>
-#include "oauth2.hpp"
-#include <vector>
-#include <iomanip>
+#include "audio-player.hpp"
 #include "database.hpp"
 #include "downloader.hpp"
+#include "oauth2.hpp"
 
-static void displaySounds(const std::vector<Sound>& sounds) {
-    std::cout << std::string(80, '-') << "\n";
-    std::cout << std::left << std::setw(8) << "ID"
-        << std::setw(30) << "Name"
-        << std::setw(10) << "Duration"
-        << std::setw(10) << "Rating"
-        << "Downloads\n";
-    std::cout << std::string(80, '-') << "\n";
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <regex>
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
+#include <deque>
+#include <functional>
 
-    for (const auto& s : sounds) {
-        std::cout << std::left << std::setw(8) << s.id
-            << std::setw(30) << s.name.substr(0, 28)
-            << std::setw(10)
-            << std::fixed << std::setprecision(1) << s.duration
-            << std::setw(10) << s.rating
-            << s.download_count << "\n";
-    }
-    std::cout << std::string(80, '-') << "\n";
+using namespace ftxui;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+std::string cleanInput(const std::string& input) {
+    std::string clean = std::regex_replace(input, std::regex("[\\r\\n\\t]+"), " ");
+    return std::regex_replace(clean, std::regex("^\\s+|\\s+$"), "");
 }
 
-static std::string trim(std::string str) {
-    size_t start = str.find_first_not_of(" \n\r\t");
-    size_t end = str.find_last_not_of(" \n\r\t");
-    if (start == str.npos) return "";
-    return str.substr(start, end - start + 1);
+std::string formatDuration(double seconds) {
+    int m = static_cast<int>(seconds) / 60;
+    int s = static_cast<int>(seconds) % 60;
+    std::stringstream ss;
+    ss << m << ":" << std::setfill('0') << std::setw(2) << s;
+    return ss.str();
 }
 
-int main() {
+// ============================================================================
+// App State & Task Queue
+// ============================================================================
+
+struct AppState {
     AudioPlayer player;
-    std::cout << "=== Freesound OAuth2 Authorization Flow ===\n\n";
+    Database db{ "freesound.db" };
+    std::unique_ptr<Downloader> downloader;
+    bool offline_mode = false;
 
-    // Configuration
+    // UI Data (Read by Main Thread only)
+    std::vector<Sound> all_sounds;
+    std::vector<Sound> visible_sounds;
+    std::vector<std::string> menu_items;
+
+    std::vector<std::pair<int, std::string>> search_results;
+    std::vector<std::string> search_menu_items;
+
+    std::string status_message = "Ready.";
+
+    // Sorting
+    int sort_selected = 0;
+    std::vector<std::string> sort_options = { "Date Added", "Name", "Artist", "Duration" };
+
+    // Thread Safety Mechanism
+    std::mutex task_mutex;
+    std::deque<std::function<void()>> task_queue;
+
+    // Call this from ANY thread to schedule an update on the Main Thread
+    void postTask(std::function<void()> task, ScreenInteractive* screen) {
+        {
+            std::lock_guard<std::mutex> lock(task_mutex);
+            task_queue.push_back(task);
+        }
+        screen->Post(Event::Custom); // Wake up the UI loop
+    }
+
+    // Call this ONLY from the Main Thread (inside render loop)
+    void processTasks() {
+        std::lock_guard<std::mutex> lock(task_mutex);
+        while (!task_queue.empty()) {
+            task_queue.front()(); // Execute the task
+            task_queue.pop_front();
+        }
+    }
+
+    // pause / play music by changing the player state
+    void togglePlayback() {
+        auto state = player.getState();
+        if (state == PlaybackState::Playing) player.pause();
+        else if (state == PlaybackState::Paused) player.resume();
+    }
+
+    // Logic to run on Main Thread
+    void refreshLibraryUI(const std::string& query = "") {
+        // 1. Filter
+        visible_sounds.clear();
+        std::string lower_query = query;
+        std::transform(lower_query.begin(), lower_query.end(), lower_query.begin(), ::tolower);
+
+        for (const auto& s : all_sounds) {
+            if (query.empty()) {
+                visible_sounds.push_back(s);
+                continue;
+            }
+            std::string lower_name = s.name;
+            std::string lower_artist = s.username;
+            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+            std::transform(lower_artist.begin(), lower_artist.end(), lower_artist.begin(), ::tolower);
+
+            if (lower_name.find(lower_query) != std::string::npos ||
+                lower_artist.find(lower_query) != std::string::npos) {
+                visible_sounds.push_back(s);
+            }
+        }
+
+        // 2. Sort
+        std::sort(visible_sounds.begin(), visible_sounds.end(), [&](const Sound& a, const Sound& b) {
+            if (sort_selected == 1) return a.name < b.name;
+            if (sort_selected == 2) return a.username < b.username;
+            if (sort_selected == 3) return a.duration < b.duration;
+            return a.added_date > b.added_date;
+            });
+
+        // 3. Rebuild Menu Strings
+        menu_items.clear();
+        for (const auto& s : visible_sounds) {
+            std::stringstream ss;
+            ss << std::left << std::setw(25) << s.name.substr(0, 23) << " | "
+                << std::setw(15) << s.username.substr(0, 15) << " | "
+                << s.added_date.substr(0, 10);
+            menu_items.push_back(ss.str());
+        }
+    }
+
+    void reloadDbAndRefresh() {
+        all_sounds = db.getAllSounds();
+        refreshLibraryUI("");
+    }
+};
+
+// ============================================================================
+// Auth Logic
+// ============================================================================
+std::string performAuthCLI(bool& is_offline) {
+    std::cout << "=== Freesound Setup ===\n";
+    std::cout << "Press ENTER for Offline Mode.\n";
     std::string client_id = "7FZXaYAs1qtPnnElA61x";
+    std::string auth_url = OAuth2::buildAuthorizationUrl(client_id, "http://freesound.org/home/app_permissions/permission_granted/.");
+
+    std::cout << "Auth URL: " << auth_url << "\nCode: ";
+    std::string code;
+    std::getline(std::cin, code);
+    code = cleanInput(code);
+
+    if (code.empty()) {
+        is_offline = true;
+        return "";
+    }
     std::string client_secret = "iLQASrQhEgZcBFufIjz1EHsTmX0FKVmwqTqMUaRt";
-    std::string redirect_uri = "http://freesound.org/home/app_permissions/permission_granted/.";
+    std::string response = OAuth2::exchangeCodeForToken(client_id, client_secret, code);
+    return OAuth2::extractAccessToken(response);
+}
 
-    std::string download_dir = "./sounds";
-    Database db("freesound.db");
-    db.initSchema();
+// ============================================================================
+// Main
+// ============================================================================
+int main() {
+    auto app_state = std::make_shared<AppState>();
+    app_state->db.initSchema();
 
-    // Step 1: Generate authorization URL
-    std::string auth_url = OAuth2::buildAuthorizationUrl(
-        client_id,
-        redirect_uri
-    );
-
-    std::cout << "Step 1: Open this URL in your browser:\n"
-        << auth_url << "\n\n";
-
-    // Step 2: Wait for user to authorize and get code
-    std::cout << "After authorizing, you'll be redirected.\n"
-        << "Paste the authorization code here: ";
-
-    std::string auth_code;
-    std::getline(std::cin, auth_code);
-
-    // Step 3: Exchange code for access token
-    std::cout << "\nExchanging authorization code for token...\n";
-
-    std::string response = OAuth2::exchangeCodeForToken(
-        client_id,
-        client_secret,
-        auth_code
-    );
-
-
-    // Step 4: Extract and display token
-    std::string access_token = OAuth2::extractAccessToken(response);
-
-    if (!access_token.empty()) {
-        std::cout << "✓ Success! Access token received:\n"
-            << access_token << "\n\n";
+    std::string token = performAuthCLI(app_state->offline_mode);
+    if (!app_state->offline_mode) {
+        app_state->downloader = std::make_unique<Downloader>(token, "./sounds");
     }
 
-    Downloader downloader(access_token, download_dir);
+    // Initial Load
+    app_state->all_sounds = app_state->db.getAllSounds();
+    app_state->refreshLibraryUI();
 
-    std::string command;
-    while (true) {
-        std::cout << "\n[Commands: search, list, download, play, pause, status, help, quit]\n"
-            << "> ";
-        std::getline(std::cin, command);
-        command = trim(command);
+    auto screen = ScreenInteractive::Fullscreen();
+    Component lib_input;
+    Component search_input;
 
-        if (command == "quit") {
-            break;
+    // =========================
+    // TAB 1: LIBRARY
+    // =========================
+    std::string lib_query_str;
+    auto sort_radio = Radiobox(&app_state->sort_options, &app_state->sort_selected);
+
+    InputOption lib_input_opt;
+    lib_input_opt.on_enter = [&] {
+        std::string q = cleanInput(lib_query_str);
+        lib_query_str = q;
+        // Direct call safe here because on_enter is Main Thread
+        app_state->refreshLibraryUI(q);
+        app_state->status_message = "Filtered: " + q;
+        };
+    lib_input = Input(&lib_query_str, "Search library...", lib_input_opt);
+
+    // Hook into Sort change
+    auto sort_container = Container::Vertical({ sort_radio }) | CatchEvent([&](Event e) {
+        if (e == Event::Return || e == Event::Character(' ')) {
+            app_state->refreshLibraryUI(cleanInput(lib_query_str));
         }
-        else if (command.substr(0, 4) == "play") {
-            int sound_id;
-            std::cout << "Enter sound ID to play: ";
-            std::cin >> sound_id;
-            std::cin.ignore();
+        return false;
+        });
 
-            auto sounds = db.getAllSounds();
+    int lib_selected = 0;
+    MenuOption menu_opt;
+    menu_opt.on_enter = [&] {
+        if (lib_selected < app_state->visible_sounds.size()) {
+            auto& s = app_state->visible_sounds[lib_selected];
+            app_state->status_message = "Playing: " + s.name;
+            app_state->player.play(fs::absolute(s.file_path).string());
+        }
+        };
+    auto lib_menu = Menu(&app_state->menu_items, &lib_selected, menu_opt);
 
-            for (auto& s : sounds) {
-                if (s.id == sound_id) {
-                    std::string abs_path = fs::absolute(s.file_path).string();
-                    player.play(abs_path);
-                    std::cout << "▶ Playing: " << s.name << "\n";
-                }
+    auto library_component = Container::Vertical({
+        lib_input,
+        Container::Horizontal({
+            Renderer([] { return text("Sort: ") | center; }),
+            sort_container
+        }),
+        Renderer([] { return separator(); }),
+        lib_menu
+        });
+
+    // =========================
+    // TAB 2: ONLINE SEARCH
+    // =========================
+    auto search_component = Container::Vertical({});
+
+    if (!app_state->offline_mode) {
+        // We must keep search_query persistent so Input can bind to it
+        static std::string search_query;
+        static int search_selected = 0;
+
+        InputOption s_opt;
+        s_opt.on_enter = [&] {
+            std::string cleaned_q = cleanInput(search_query);
+            search_query = cleaned_q;
+            app_state->status_message = "Searching: " + cleaned_q;
+
+            // Launch Thread
+            std::thread([app_state, &screen, cleaned_q] {
+                auto res = app_state->downloader->searchSounds(cleaned_q, 15);
+
+                // CRITICAL: Update UI Data via Task Queue
+                app_state->postTask([app_state, res, cleaned_q]() {
+                    app_state->search_results.clear();
+                    app_state->search_menu_items.clear();
+
+                    if (res.contains("results")) {
+                        for (const auto& item : res["results"]) {
+                            // Store ID and Name as before
+                            app_state->search_results.push_back({ item["id"], item["name"] });
+
+                            // FORMAT DISPLAY STRING
+                            // Example: "Explosion.wav | user123 | 44.1kHz | 2.5MB"
+
+                            std::string name = item.value("name", "Unknown");
+                            std::string user = item.value("username", "Unknown");
+                            int sr = item.value("samplerate", 0);
+                            int size_bytes = item.value("filesize", 0);
+                            double size_mb = size_bytes / (1024.0 * 1024.0);
+
+                            std::stringstream ss;
+                            ss << std::left << std::setw(30) << name.substr(0, 28) << " | "
+                                << std::setw(15) << user.substr(0, 15) << " | "
+                                << (sr / 1000) << "kHz | "
+                                << std::fixed << std::setprecision(1) << size_mb << "MB";
+
+                            app_state->search_menu_items.push_back(ss.str());
+                        }
+                        app_state->status_message = "Results for '" + cleaned_q + "': " + std::to_string(app_state->search_results.size());
+                    }
+                    else {
+                        app_state->status_message = "No results.";
+                    }
+                    }, &screen);
+                }).detach();
+            };
+
+        search_input = Input(&search_query, "Search Freesound...", s_opt);
+
+        MenuOption dl_opt;
+        dl_opt.on_enter = [&] {
+            int idx = search_selected;
+            if (idx < app_state->search_results.size()) {
+                int id = app_state->search_results[idx].first;
+                app_state->status_message = "Downloading ID " + std::to_string(id) + "...";
+
+                std::thread([app_state, &screen, id] {
+                    std::string path;
+                    bool success = app_state->downloader->downloadSound(id, path);
+
+                    // CRITICAL: Database write and UI update via Task Queue
+                    app_state->postTask([app_state, success, id, path]() {
+                        if (success) {
+                            // Mock metadata - in real app, fetch it
+                            json meta = app_state->downloader->getSoundMetadata(id);
+                            Sound s;
+                            s.id = id;
+                            s.file_path = path;
+                            s.name = meta.value("name", "Unknown");
+                            s.username = meta.value("username", "Unknown");
+                            s.duration = meta.value("duration", 0.0);
+
+                            // Handle added_date manually if not in JSON
+                            auto t = std::time(nullptr);
+                            auto tm = *std::localtime(&t);
+                            std::stringstream ss;
+                            ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+                            s.added_date = ss.str();
+
+                            app_state->db.addSound(s);
+                            app_state->reloadDbAndRefresh(); // Updates UI vectors safely
+                            app_state->status_message = "Downloaded: " + s.name;
+                        }
+                        else {
+                            app_state->status_message = "Download Failed.";
+                        }
+                        }, &screen);
+                    }).detach();
             }
-        }
-        else if (command == "pause") {
-            player.pause();
-        }
-        else if (command == "status") {
-            std::cout << "Progress: " << (player.getProgress() * 100) << "%\n";
-        }
-        else if (command == "search") {
-            std::cout << "Enter search query: ";
-            std::string query;
-            std::getline(std::cin, query);
-            query = trim(query);
+            };
 
-            std::cout << "Searching...\n";
-            json results = downloader.searchSounds(query, 10);
+        auto search_menu = Menu(&app_state->search_menu_items, &search_selected, dl_opt);
 
-            if (results.contains("results")) {
-                for (const auto& item : results["results"]) {
-                    int id = item["id"];
-                    std::cout << "ID: " << id << " | "
-                        << item["name"] << "\n";
-                }
-            }
-        }
-        else if (command == "download") {
-            int sound_id;
-            std::cout << "Enter sound ID to download: ";
-            std::cin >> sound_id;
-            std::cin.ignore();
-
-            if (!db.soundExists(sound_id)) {
-                std::cout << "Downloading...\n";
-                std::string filepath;
-                if (downloader.downloadSound(sound_id, filepath)) {
-                    json metadata = downloader.getSoundMetadata(sound_id);
-                    Sound s;
-                    s.id = sound_id;
-                    s.name = metadata.value("name", "Unknown");
-                    s.url = metadata.value("url", "");
-                    s.duration = metadata.value("duration", 0.0);
-                    s.rating = metadata.value("avg_rating", 0.0);
-                    s.download_count = metadata.value("num_downloads", 0);
-                    s.file_path = filepath;
-
-                    db.addSound(s);
-                    std::cout << "✓ Downloaded and saved to database\n";
-                }
-                else {
-                    std::cout << "✗ Download failed\n";
-                }
-            }
-            else {
-                std::cout << "Sound already downloaded\n";
-            }
-        }
-        else if (command == "list") {
-            std::cout << "[Sort by: date, rating, downloads, duration]\n"
-                << "> ";
-            std::string sort_by;
-            std::getline(std::cin, sort_by);
-            sort_by = trim(sort_by);
-
-            if (sort_by.empty()) sort_by = "added_date";
-
-            auto sounds = db.getSoundsSorted(sort_by);
-            displaySounds(sounds);
-        }
-        else if (command == "playlists") {
-            std::cout << "[pl-create, pl-list, pl-add, pl-remove, pl-view, pl-delete]\n"
-                << "> ";
-            std::string subcmd;
-            std::getline(std::cin, subcmd);
-            subcmd = trim(subcmd);
-
-            if (subcmd.find("pl-create") == 0) {
-                std::cout << "Playlist name: ";
-                std::string name;
-                std::getline(std::cin, name);
-                db.createPlaylist(trim(name));
-                std::cout << "✓ Playlist created\n";
-            }
-            else if (subcmd.find("pl-list") == 0) {
-                auto playlists = db.getAllPlaylists();
-                for (const auto& p : playlists) {
-                    std::cout << "[ID:" << p.id << "] " << p.name
-                        << " (created: " << p.created_date << ")\n";
-                }
-            }
-        }
-        else if (command == "help") {
-            std::cout << "search       - Find sounds on Freesound\n"
-                << "download     - Download a sound by ID\n"
-                << "list         - Show all downloaded sounds\n"
-                << "playlists    - Manage playlists\n"
-                << "quit         - Exit\n";
-        }
+        search_component = Container::Vertical({
+            search_input,
+            Renderer([] { return separator(); }),
+            search_menu
+            });
     }
-    std::cout << "Goodbye!\n";
+    else {
+        search_component = Renderer([] {
+            return text("OFFLINE MODE") | center | color(Color::Red);
+            });
+    }
+
+    // =========================
+    // LAYOUT & EVENT LOOP
+    // =========================
+    int tab_index = 0;
+    std::vector<std::string> tab_names = { "Library", "Search Online" };
+    auto tab_toggle = Toggle(&tab_names, &tab_index);
+    auto tab_content = Container::Tab({ library_component, search_component }, &tab_index);
+
+    auto main_container = Container::Vertical({
+        Container::Horizontal({ tab_toggle }),
+        Renderer([] { return separator(); }),
+        tab_content
+        });
+
+    // Global Event Handler
+    main_container |= CatchEvent([&](Event event) {
+        // 1. Process Async Tasks
+        if (event == Event::Custom) {
+            app_state->processTasks();
+            return true;
+        }
+
+        // 2. Global Hotkeys
+        if (event == Event::Character(' ')) {
+            // FIX: Check if user is typing in an Input box
+            if (lib_input->Focused()) return false; // Let Input type the space
+            if (search_input && search_input->Focused()) return false; // Let Search type the space
+
+            // If not typing, toggle playback
+            app_state->togglePlayback();
+            return true;
+        }
+
+        // 3. Fix Sort Update on Arrow Keys
+        if (tab_index == 0) {
+            static int last_sort = -1;
+            if (app_state->sort_selected != last_sort) {
+                app_state->refreshLibraryUI(cleanInput(lib_query_str));
+                last_sort = app_state->sort_selected;
+            }
+        }
+        return false;
+        });
+
+    auto renderer = Renderer(main_container, [&] {
+        float p = app_state->player.getProgress();
+        return vbox({
+            hbox({
+                text(" AUDIO PLAYER ") | bold | bgcolor(Color::Blue),
+                filler(),
+                text(" " + app_state->status_message + " ") | color(Color::Yellow)
+            }),
+            separator(),
+            tab_toggle->Render(),
+            separator(),
+            tab_content->Render() | flex,
+            separator(),
+            hbox({
+                text(" Status: "),
+                gauge(p) | flex,
+                text(" " + std::to_string((int)(p * 100)) + "% ")
+            }) | color(Color::Cyan)
+            }) | border;
+        });
+
+    // Background ticker
+    std::atomic<bool> running{ true };
+    std::thread refresher([&] {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            screen.Post(Event::Custom);
+        }
+        });
+
+    screen.Loop(renderer);
+    running = false;
+    refresher.join();
 
     return 0;
 }

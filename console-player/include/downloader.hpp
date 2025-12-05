@@ -63,9 +63,9 @@ inline json Downloader::searchSounds(
 
     if (curl) {
         std::string url = "https://freesound.org/apiv2/search/?"
-            "q=" + query +
+            "query=" + query +
             "&page_size=" + std::to_string(limit) +
-            "&fields=id,name,duration,rating,download_count,previews";
+            "&fields=id,name,duration,username,filesize,samplerate";
         struct curl_slist* headers = NULL;
         std::string bearer = "Authorization: Bearer " + this->access_token;
         headers = curl_slist_append(headers, bearer.c_str());
