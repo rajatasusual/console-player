@@ -2,6 +2,8 @@
 #include <iostream>
 #include <cmath>
 #include <filesystem>
+#include <vector>
+#include <mutex>
 
 namespace fs = std::filesystem;
 
@@ -35,6 +37,8 @@ AudioPlayer::AudioPlayer()
 
     // CRITICAL: Give threads time to initialize
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    wave_buffer_.resize(100, 0.0f); // Pre-allocate for 100 points
 }
 
 AudioPlayer::~AudioPlayer() {
@@ -193,7 +197,29 @@ int AudioPlayer::audioCallback(
             self->file_ended_.store(false, std::memory_order_release);
         }
     }
-    // -----------------------------------
+
+    if (self->wave_mutex_.try_lock()) {
+        int ch = self->file_info_.channels > 0 ? self->file_info_.channels : 1;
+
+        // We want ~100 samples for the graph. 
+        // If we have 1024 frames, take every 10th frame to span the whole buffer
+        size_t capture_size = 100;
+        if (self->wave_buffer_.size() != capture_size) self->wave_buffer_.resize(capture_size);
+
+        int step = frameCount / capture_size;
+        if (step < 1) step = 1;
+
+        for (size_t i = 0; i < capture_size; ++i) {
+            size_t src_idx = i * step;
+            if (src_idx >= frameCount) break;
+
+            // Get sample from the output buffer we just filled
+            // Just take the first channel (Left) for simplicity
+            float sample = out[src_idx * ch];
+            self->wave_buffer_[i] = sample;
+        }
+        self->wave_mutex_.unlock();
+    }
 
     return paContinue;
 }
@@ -339,4 +365,12 @@ void AudioPlayer::audioThreadLoop() {
     while (!should_exit_.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+}
+
+// ============================================================================
+// Visualization buffer for getting waveform Data
+// ============================================================================
+std::vector<float> AudioPlayer::getWaveformData() {
+    std::lock_guard<std::mutex> lock(wave_mutex_);
+    return wave_buffer_;
 }

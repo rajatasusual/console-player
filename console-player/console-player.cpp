@@ -2,6 +2,8 @@
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/util/ref.hpp>
+#include <ftxui/dom/node.hpp>
+#include <ftxui/screen/color.hpp>
 
 #include "audio-player.hpp"
 #include "database.hpp"
@@ -61,6 +63,10 @@ struct AppState {
     // Sorting
     int sort_selected = 0;
     std::vector<std::string> sort_options = { "Date Added", "Name", "Artist", "Duration" };
+
+    // CURRENT PLAYING INFO
+    Sound current_sound; // Holds info about currently playing track
+    ftxui::Box graph_box;
 
     // Thread Safety Mechanism
     std::mutex task_mutex;
@@ -212,6 +218,8 @@ int main() {
             auto& s = app_state->visible_sounds[lib_selected];
             app_state->status_message = "Playing: " + s.name;
             app_state->player.play(fs::absolute(s.file_path).string());
+
+            app_state->current_sound = s;
         }
         };
     auto lib_menu = Menu(&app_state->menu_items, &lib_selected, menu_opt);
@@ -341,12 +349,95 @@ int main() {
     }
 
     // =========================
+    // TAB 3: PLAYER
+    // =========================
+
+    auto player_component = Renderer([&] {
+        auto wave_data = app_state->player.getWaveformData();
+
+        // 1. Setup Dimensions
+        // Use the persistent graph_box from AppState
+        int term_width = app_state->graph_box.x_max - app_state->graph_box.x_min;
+        if (term_width <= 0) term_width = 120; // Fallback default
+
+        int c_width = term_width * 2; // Double resolution for Braille (2 dots per char)
+        int c_height = 40;
+
+        Canvas c = Canvas(c_width, c_height);
+
+        // 2. Draw Waveform with baked-in Color
+        if (!wave_data.empty()) {
+            int mid_y = c_height / 2;
+            float step = (float)wave_data.size() / (float)c_width;
+
+            for (int x = 0; x < c_width; ++x) {
+                // --- Peak Detection ---
+                int start = (int)(x * step);
+                int end = (int)((x + 1) * step);
+
+                if (start >= wave_data.size()) break;
+                if (end > wave_data.size()) end = wave_data.size();
+
+                float max_val = 0.0f;
+                for (int i = start; i < end; ++i) {
+                    float v = std::abs(wave_data[i]);
+                    if (v > max_val) max_val = v;
+                }
+
+                // Clamp value to prevent drawing errors
+                max_val = (std::min)(1.0f, max_val);
+
+                // --- Color Calculation ---
+                // Calculate color based on how "loud" this specific column is.
+                // Quiet = Cyan, Loud = Red
+                Color point_color = Color::Interpolate(max_val * 10.0f, Color::Cyan, Color::Red);
+
+                int h = (int)(max_val * mid_y);
+
+                // Draw the vertical bar for this time slice
+                for (int y = mid_y - h; y <= mid_y + h; ++y) {
+                    // PASS COLOR DIRECTLY TO DRAWPOINT
+                    // This forces the canvas to store the color for this dot
+                    c.DrawPoint(x, y, true, point_color);
+                }
+            }
+        }
+
+        // 3. Render
+        return vbox({
+            filler(),
+            vbox({
+                text(app_state->current_sound.name) | bold | center | color(Color::Cyan),
+                text("by " + app_state->current_sound.username) | center | color(Color::White)
+            }) | borderRounded | center,
+            filler(),
+
+            // Canvas Container
+            hbox({
+                canvas(std::move(c))
+                | reflect(app_state->graph_box) // Capture size for next frame
+                | flex                          // Stretch to fill width
+            })
+            | size(HEIGHT, EQUAL, 10)
+            | border,
+
+            filler()
+            });
+        });
+
+
+    // =========================
     // LAYOUT & EVENT LOOP
     // =========================
     int tab_index = 0;
-    std::vector<std::string> tab_names = { "Library", "Search Online" };
+    std::vector<std::string> tab_names = { "Library", "Search Online", "Player"};
     auto tab_toggle = Toggle(&tab_names, &tab_index);
-    auto tab_content = Container::Tab({ library_component, search_component }, &tab_index);
+    auto tab_content = Container::Tab({ 
+        library_component, 
+        search_component , 
+        player_component
+        }, 
+        &tab_index);
 
     auto main_container = Container::Vertical({
         Container::Horizontal({ tab_toggle }),
@@ -409,7 +500,7 @@ int main() {
     std::atomic<bool> running{ true };
     std::thread refresher([&] {
         while (running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             screen.Post(Event::Custom);
         }
         });

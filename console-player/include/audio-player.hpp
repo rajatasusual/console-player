@@ -5,6 +5,9 @@
 #include <queue>
 #include <memory>
 #include <string>
+#include <mutex>
+#include <vector>
+
 #include <portaudio.h>
 #include <sndfile.h>
 
@@ -47,6 +50,8 @@ public:
     void pause();
     void resume();
     void stop();
+
+    std::vector<float> getWaveformData();
 
     // Query state (lock-free reads)
     PlaybackState getState() const;
@@ -101,4 +106,8 @@ private:
     // === Threads ===
     std::thread audio_thread_;
     std::thread file_reader_thread_;
+
+    // VISUALIZATION
+    std::vector<float> wave_buffer_; // Holds a snapshot of audio
+    mutable std::mutex wave_mutex_;  // Protects the buffer
 };
