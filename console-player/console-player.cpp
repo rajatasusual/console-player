@@ -145,8 +145,8 @@ struct AppState {
 std::string performAuthCLI(bool& is_offline) {
     std::cout << "=== Freesound Setup ===\n";
     std::cout << "Press ENTER for Offline Mode.\n";
-    std::string client_id = "7FZXaYAs1qtPnnElA61x";
-    std::string auth_url = OAuth2::buildAuthorizationUrl(client_id, "http://freesound.org/home/app_permissions/permission_granted/.");
+
+    std::string auth_url = OAuth2::buildAuthorizationUrl();
 
     std::cout << "Auth URL: " << auth_url << "\nCode: ";
     std::string code;
@@ -157,8 +157,7 @@ std::string performAuthCLI(bool& is_offline) {
         is_offline = true;
         return "";
     }
-    std::string client_secret = "iLQASrQhEgZcBFufIjz1EHsTmX0FKVmwqTqMUaRt";
-    std::string response = OAuth2::exchangeCodeForToken(client_id, client_secret, code);
+    std::string response = OAuth2::exchangeCodeForToken(code);
     return OAuth2::extractAccessToken(response);
 }
 
