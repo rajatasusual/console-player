@@ -111,6 +111,37 @@ void AudioPlayer::stop() {
     file_ended_.store(false, std::memory_order_release);
 }
 
+void AudioPlayer::seekForward(int seconds) {
+    int current = current_frame_.load(std::memory_order_relaxed);
+    int target = current + (SAMPLE_RATE * seconds);
+
+    // Clamp to file bounds
+    int total = total_frames_.load(std::memory_order_relaxed);
+    target = std::min(target, total - 1);
+
+    seekToFrame(target);
+}
+
+void AudioPlayer::seekBackward(int seconds) {
+    int current = current_frame_.load(std::memory_order_relaxed);
+    int target = current - (SAMPLE_RATE * seconds);
+
+    // Clamp to file bounds
+    target = std::max(target, 0);
+
+    seekToFrame(target);
+}
+
+void AudioPlayer::seekToFrame(int frame) {
+    // Validate frame is within bounds
+    int total = total_frames_.load(std::memory_order_relaxed);
+    frame = std::max(0, std::min(frame, total - 1));
+
+    // Atomically request seek
+    seek_target_frame_.store(frame, std::memory_order_relaxed);
+    seek_requested_.store(true, std::memory_order_release);
+}
+
 PlaybackState AudioPlayer::getState() const {
     return state_.load(std::memory_order_acquire);
 }
@@ -235,7 +266,34 @@ void AudioPlayer::swapBuffers() {
 // ============================================================================
 
 void AudioPlayer::fileReaderThreadLoop() {
+
     while (!should_exit_.load(std::memory_order_acquire)) {
+        // === Handle seek requests (before file operations) ===
+        if (seek_requested_.load(std::memory_order_acquire)) {
+            if (current_file_ != nullptr) {
+                int target_frame = seek_target_frame_.load(std::memory_order_relaxed);
+
+                // Execute seek on libsndfile
+                sf_count_t result = sf_seek(current_file_, target_frame, SEEK_SET);
+
+                if (result >= 0) {
+                    // Seek successful
+                    current_frame_.store(static_cast<int>(result), std::memory_order_release);
+
+                    // Clear the fill buffer since we've changed position
+                    fill_buffer_->frames_read = 0;
+                    swap_ready_.store(true, std::memory_order_release);
+                }
+                else {
+                    // Seek failed (invalid position, unseekable format, etc.)
+                    // Stay at current position or handle error
+                }
+            }
+
+            // Clear seek request
+            seek_requested_.store(false, std::memory_order_release);
+        }
+
         // Check if new file requested
         if (next_file_requested_.load(std::memory_order_acquire)) {
             // Close current file if open

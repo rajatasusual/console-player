@@ -51,6 +51,11 @@ public:
     void resume();
     void stop();
 
+    // Seek control (thread-safe, non-blocking, lock-free)
+    void seekForward(int seconds = 5);   // Skip forward N seconds
+    void seekBackward(int seconds = 5);  // Skip backward N seconds
+    void seekToFrame(int frame);          // Seek to absolute frame position
+
     std::vector<float> getWaveformData();
 
     // Query state (lock-free reads)
@@ -86,6 +91,10 @@ private:
     std::atomic<int> total_frames_{ 0 };
     std::atomic<bool> should_exit_{ false };
     std::atomic<bool> file_ended_{ false };
+
+    // === Seek State (lock-free) ===
+    std::atomic<bool> seek_requested_{ false };
+    std::atomic<int> seek_target_frame_{ 0 };
 
     // === Buffers ===
     AudioBuffer buffer1_, buffer2_;

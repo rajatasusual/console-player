@@ -349,29 +349,31 @@ int main() {
     }
 
     // =========================
-    // TAB 3: PLAYER
+    // TAB 3: PLAYER (UPDATED)
     // =========================
 
+    // Create clickable button handlers
     auto player_component = Renderer([&] {
         auto wave_data = app_state->player.getWaveformData();
+        int current_frame = app_state->player.getCurrentFrame();
+        int total_frames = app_state->player.getTotalFrames();
+        auto state = app_state->player.getState();
 
-        // 1. Setup Dimensions
-        // Use the persistent graph_box from AppState
+        // 1. Setup Canvas Dimensions
         int term_width = app_state->graph_box.x_max - app_state->graph_box.x_min;
-        if (term_width <= 0) term_width = 120; // Fallback default
+        if (term_width <= 0) term_width = 120;
 
-        int c_width = term_width * 2; // Double resolution for Braille (2 dots per char)
+        int c_width = term_width * 2;
         int c_height = 40;
 
         Canvas c = Canvas(c_width, c_height);
 
-        // 2. Draw Waveform with baked-in Color
+        // 2. Draw Waveform
         if (!wave_data.empty()) {
             int mid_y = c_height / 2;
             float step = (float)wave_data.size() / (float)c_width;
 
             for (int x = 0; x < c_width; ++x) {
-                // --- Peak Detection ---
                 int start = (int)(x * step);
                 int end = (int)((x + 1) * step);
 
@@ -384,27 +386,38 @@ int main() {
                     if (v > max_val) max_val = v;
                 }
 
-                // Clamp value to prevent drawing errors
                 max_val = (std::min)(1.0f, max_val);
-
-                // --- Color Calculation ---
-                // Calculate color based on how "loud" this specific column is.
-                // Quiet = Cyan, Loud = Red
                 Color point_color = Color::Interpolate(max_val * 10.0f, Color::Cyan, Color::Red);
 
                 int h = (int)(max_val * mid_y);
 
-                // Draw the vertical bar for this time slice
                 for (int y = mid_y - h; y <= mid_y + h; ++y) {
-                    // PASS COLOR DIRECTLY TO DRAWPOINT
-                    // This forces the canvas to store the color for this dot
                     c.DrawPoint(x, y, true, point_color);
                 }
             }
         }
 
-        // 3. Render
+        // 3. Calculate time strings
+        double current_seconds = (total_frames > 0) ? (current_frame / (double)SAMPLE_RATE) : 0.0;
+        double total_seconds = (total_frames > 0) ? (total_frames / (double)SAMPLE_RATE) : 0.0;
+        std::string current_time = formatDuration(current_seconds);
+        std::string total_time = formatDuration(total_seconds);
+
+        // 4. Playback state indicator
+        std::string state_str = "Paused ⏸";
+        Color state_color = Color::Yellow;
+        if (state == PlaybackState::Playing) {
+            state_str = "Playing ▶";
+            state_color = Color::Green;
+        }
+        else if (state == PlaybackState::Stopped) {
+            state_str = "Stopped ⏹";
+            state_color = Color::Red;
+        }
+
+        // 7. Assemble full player view
         return vbox({
+            // Title and Artist
             filler(),
             vbox({
                 text(app_state->current_sound.name) | bold | center | color(Color::Cyan),
@@ -412,31 +425,48 @@ int main() {
             }) | borderRounded | center,
             filler(),
 
-            // Canvas Container
+            // Waveform Canvas
             hbox({
                 canvas(std::move(c))
-                | reflect(app_state->graph_box) // Capture size for next frame
-                | flex                          // Stretch to fill width
+                    | reflect(app_state->graph_box)
+                    | flex
             })
             | size(HEIGHT, EQUAL, 10)
             | border,
 
-            filler()
+            // Time Display
+            hbox({
+                text(" " + current_time) | color(Color::Cyan),
+                filler(),
+                text(total_time + " ") | color(Color::Cyan)
+            }) | size(HEIGHT, EQUAL, 1),
+
+            filler(),
+
+            // Playback State
+            text(state_str) | center | color(state_color),
+
+            filler(),
+
+            // Keyboard shortcuts help
+            vbox({
+                text("Keyboard: [Space]=Play/Pause | [←/→]=Seek | [Ctrl+←/→]=Tabs")
+                    | center | dim | color(Color::GrayLight)
+			})
             });
         });
-
 
     // =========================
     // LAYOUT & EVENT LOOP
     // =========================
     int tab_index = 0;
-    std::vector<std::string> tab_names = { "Library", "Search Online", "Player"};
+    std::vector<std::string> tab_names = { "Library", "Search Online", "Player" };
     auto tab_toggle = Toggle(&tab_names, &tab_index);
-    auto tab_content = Container::Tab({ 
-        library_component, 
-        search_component , 
+    auto tab_content = Container::Tab({
+        library_component,
+        search_component ,
         player_component
-        }, 
+        },
         &tab_index);
 
     auto main_container = Container::Vertical({
@@ -453,18 +483,64 @@ int main() {
             return true;
         }
 
-        // 2. Global Hotkeys
-        if (event == Event::Character(' ')) {
-            // FIX: Check if user is typing in an Input box
-            if (lib_input->Focused()) return false; // Let Input type the space
-            if (search_input && search_input->Focused()) return false; // Let Search type the space
+        // ============================================================
+        // 2. TAB NAVIGATION (Ctrl+Left/Right)
+        // ============================================================
+        if (event == Event::ArrowLeftCtrl || event.input() == "<C-left>") {
+            tab_index = (tab_index - 1 + 3) % 3;
+            return true;
+        }
+        if (event == Event::ArrowRightCtrl || event.input() == "<C-right>") {
+            tab_index = (tab_index + 1) % 3;
+            return true;
+        }
 
-            // If not typing, toggle playback
+        // ============================================================
+        // 3. GLOBAL HOTKEYS (Space for Play/Pause)
+        // ============================================================
+        if (event == Event::Character(' ')) {
+            if (lib_input && lib_input->Focused()) return false;
+            if (search_input && search_input->Focused()) return false;
+
             app_state->togglePlayback();
             return true;
         }
 
-        // 3. Fix Sort Update on Arrow Keys
+        // ============================================================
+        // 4. PLAYER TAB: Seek Operations & Additional Controls
+        // ============================================================
+        if (tab_index == 2) {
+            // Seek left
+            if (event == Event::ArrowLeft) {
+                app_state->player.seekBackward(5);
+                return true;
+            }
+            // Seek right
+            if (event == Event::ArrowRight) {
+                app_state->player.seekForward(5);
+                return true;
+            }
+            // Stop playback
+            if (event == Event::Character('s') || event == Event::Character('S')) {
+                app_state->player.stop();
+                app_state->status_message = "Stopped.";
+                return true;
+            }
+            // Volume/other controls can be added here
+        }
+
+        // ============================================================
+        // 5. MENU NAVIGATION (Up/Down arrows - LIBRARY & SEARCH TABS)
+        // ============================================================
+        if (tab_index == 0 || tab_index == 1) {
+            if (event == Event::ArrowUp || event == Event::ArrowDown) {
+                return false;
+            }
+        }
+
+        // ============================================================
+        // 6. SORT UPDATE (Library Tab)
+        // ============================================================
         if (tab_index == 0) {
             static int last_sort = -1;
             if (app_state->sort_selected != last_sort) {
@@ -472,6 +548,7 @@ int main() {
                 last_sort = app_state->sort_selected;
             }
         }
+
         return false;
         });
 
