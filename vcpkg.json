@@ -1,10 +1,10 @@
 {
   "dependencies": [
     "curl",
+    "ftxui",
     "libsndfile",
     "nlohmann-json",
     "portaudio",
-    "sqlite3",
-    "ftxui"
+    "sqlite3"
   ]
 }

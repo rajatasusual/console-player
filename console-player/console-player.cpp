@@ -404,14 +404,14 @@ int main() {
         std::string total_time = formatDuration(total_seconds);
 
         // 4. Playback state indicator
-        std::string state_str = "Paused ⏸";
+        std::string state_str = "Paused.";
         Color state_color = Color::Yellow;
         if (state == PlaybackState::Playing) {
-            state_str = "Playing ▶";
+            state_str = "Playing.";
             state_color = Color::Green;
         }
         else if (state == PlaybackState::Stopped) {
-            state_str = "Stopped ⏹";
+            state_str = "Stopped.";
             state_color = Color::Red;
         }
 
@@ -566,7 +566,7 @@ int main() {
             tab_content->Render() | flex,
             separator(),
             hbox({
-                text(" Status: "),
+                text(" Playback: "),
                 gauge(p) | flex,
                 text(" " + std::to_string((int)(p * 100)) + "% ")
             }) | color(Color::Cyan)
