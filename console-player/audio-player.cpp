@@ -1,6 +1,7 @@
 #include "audio-player.hpp"
 #include <iostream>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <vector>
 #include <mutex>

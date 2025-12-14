@@ -50,9 +50,12 @@ target_include_directories(audio-player PUBLIC
 # CRITICAL: Link PortAudio and SndFile to audio-player library
 if(portaudio_FOUND)
     target_link_libraries(audio-player PUBLIC portaudio)
-else()
+elseif(WIN32)
     # Manual linking for Windows (if vcpkg)
     target_link_libraries(audio-player PUBLIC portaudio_static)
+else()
+    # Fallback for other platforms
+    target_link_libraries(audio-player PUBLIC portaudio)
 endif()
 
 if(SndFile_FOUND)

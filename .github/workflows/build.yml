@@ -43,17 +43,20 @@ jobs:
 
     - name: Configure CMake
       run: |
-        cmake --preset ${{ matrix.arch }}-release
+        cmake -B build -S . -G Ninja ^
+          -DCMAKE_BUILD_TYPE=Release ^
+          -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+      shell: cmd
 
     - name: Build
-      run: |
-        cmake --build --preset ${{ matrix.arch }}-release --config Release
+      run: cmake --build build --config Release
 
     - name: Package
       run: |
         mkdir artifact
-        copy out\build\${{ matrix.arch }}-release\console-player\Release\console-player.exe artifact\
-        copy out\build\${{ matrix.arch }}-release\console-player\config.json artifact\ 2>nul || echo "No config.json"
+        copy build\console-player\Release\console-player.exe artifact\ || copy build\console-player\console-player.exe artifact\
+        copy build\console-player\config.json artifact\ 2>nul || echo "No config.json"
+      shell: cmd
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -85,6 +88,10 @@ jobs:
         script: |
           core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Fix missing includes
+      run: |
+        sed -i '1i#include <cstring>' console-player/audio-player.cpp
 
     - name: Configure CMake
       run: |
@@ -131,6 +138,14 @@ jobs:
         script: |
           core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Fix missing includes
+      run: |
+        sed -i '' '1i\#include <cstring>' console-player/audio-player.cpp
+
+    - name: Fix CMakeLists for macOS
+      run: |
+        sed -i '' 's/target_link_libraries(audio-player PUBLIC portaudio_static)/target_link_libraries(audio-player PUBLIC portaudio)/' console-player/CMakeLists.txt
 
     - name: Configure CMake
       run: |
